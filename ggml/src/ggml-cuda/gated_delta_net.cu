@@ -145,6 +145,17 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// Chunked prefill (non-KDA). Body lands in follow-up commits on this branch.
+constexpr int GDN_CHUNKED_THRESHOLD = 192; // TODO: tune via PP-{96..256} sweep
+
+static bool gdn_chunked_eligible(int S_v, int64_t n_tokens, bool kda, int cc) {
+    if (kda)                              return false; // KDA chunked is PR3
+    if (n_tokens < GDN_CHUNKED_THRESHOLD) return false;
+    if (S_v != 64 && S_v != 128)          return false;
+    if (cc < GGML_CUDA_CC_AMPERE)         return false; // f32.tf32 MMA needs SM80+
+    return true;
+}
+
 template <bool KDA>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -156,7 +167,6 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
@@ -166,6 +176,10 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // chunked dispatch hook; launch site wired in a follow-up commit
+    const bool use_chunked = gdn_chunked_eligible((int) S_v, n_tokens, KDA, cc);
+    GGML_UNUSED(use_chunked);
 
     switch (S_v) {
         case 16:
