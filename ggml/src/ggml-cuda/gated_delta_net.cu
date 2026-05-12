@@ -145,7 +145,10 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-// Chunked prefill (non-KDA). Body lands in follow-up commits on this branch.
+// Chunked prefill dispatch validation path (non-KDA), single block per (h, seq).
+// This kernel intentionally mirrors the existing token-sequential update while
+// keeping state live across chunk boundaries. The real chunk-level MMA algorithm
+// will replace the inner per-token loop in a follow-up patch.
 constexpr int GDN_CHUNKED_THRESHOLD = 192; // TODO: tune via PP-{96..256} sweep
 
 static bool gdn_chunked_eligible(int S_v, int64_t n_tokens, bool kda, int cc) {
@@ -154,6 +157,130 @@ static bool gdn_chunked_eligible(int S_v, int64_t n_tokens, bool kda, int cc) {
     if (S_v != 64 && S_v != 128)          return false;
     if (cc < GGML_CUDA_CC_AMPERE)         return false; // f32.tf32 MMA needs SM80+
     return true;
+}
+
+template <int S_v, int CS, bool KDA>
+__launch_bounds__(128, 1)
+__global__ void gated_delta_net_chunked_cuda(const float * q,
+                                             const float * k,
+                                             const float * v,
+                                             const float * g,
+                                             const float * beta,
+                                             const float * curr_state,
+                                             float *       dst,
+                                             int64_t       H,
+                                             int64_t       n_tokens,
+                                             int64_t       n_seqs,
+                                             int64_t       sq1,
+                                             int64_t       sq2,
+                                             int64_t       sq3,
+                                             int64_t       sv1,
+                                             int64_t       sv2,
+                                             int64_t       sv3,
+                                             int64_t       sb1,
+                                             int64_t       sb2,
+                                             int64_t       sb3,
+                                             const uint3   neqk1_magic,
+                                             const uint3   rq3_magic,
+                                             float         scale) {
+    static_assert(!KDA, "PR1 chunked path is non-KDA only");
+    static_assert(S_v == 64 || S_v == 128, "PR1 supports S_v in {64, 128}");
+
+    constexpr int warp_size     = 32;
+    constexpr int num_warps     = 4;
+    constexpr int cols_per_warp = S_v / num_warps;
+    constexpr int rows_per_lane = S_v / warp_size;
+    static_assert(cols_per_warp * num_warps == S_v, "S_v must be a multiple of num_warps");
+    static_assert(rows_per_lane * warp_size == S_v, "S_v must be a multiple of warp_size");
+
+    const int lane     = threadIdx.x;
+    const int warp_id  = threadIdx.y;
+    const int h_idx    = blockIdx.x;
+    const int sequence = blockIdx.y;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t state_offset     = (sequence * H + h_idx) * S_v * S_v;
+    float *       attn_data_base   = dst + (sequence * n_tokens * H + h_idx) * S_v;
+    float *       state_out        = dst + attn_score_elems + state_offset;
+    const float * state_in         = curr_state + state_offset;
+
+    // Register state: s_shard[c][r] holds S[r*warp_size + lane][warp_id*cols_per_warp + c]
+    // i.e. each warp owns cols_per_warp contiguous columns; each lane owns rows_per_lane
+    // rows of those columns via the same row-stripe as the sequential kernel.
+    float s_shard[cols_per_warp][rows_per_lane];
+
+    #pragma unroll
+    for (int c = 0; c < cols_per_warp; ++c) {
+        const int col = warp_id * cols_per_warp + c;
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            s_shard[c][r] = state_in[col * S_v + r * warp_size + lane];
+        }
+    }
+
+    const int n_chunks = (n_tokens + CS - 1) / CS;
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int t_start = chunk * CS;
+        const int t_end   = (int) n_tokens < t_start + CS ? (int) n_tokens : t_start + CS;
+
+        for (int t = t_start; t < t_end; ++t) {
+            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+            const float   beta_val  = beta[gb_offset];
+            const float   g_val     = expf(g[gb_offset]);
+
+            float k_reg[rows_per_lane];
+            float q_reg[rows_per_lane];
+            #pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int i = r * warp_size + lane;
+                k_reg[r] = k_t[i];
+                q_reg[r] = q_t[i];
+            }
+
+            float * attn_data_t = attn_data_base + t * S_v * H;
+
+            #pragma unroll
+            for (int c = 0; c < cols_per_warp; ++c) {
+                const int col = warp_id * cols_per_warp + c;
+
+                float kv_shard = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    kv_shard += s_shard[c][r] * k_reg[r];
+                }
+                const float kv_col    = warp_reduce_sum<warp_size>(kv_shard);
+                const float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+
+                float attn_partial = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data_t[col] = attn_col * scale;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < cols_per_warp; ++c) {
+        const int col = warp_id * cols_per_warp + c;
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            state_out[col * S_v + r * warp_size + lane] = s_shard[c][r];
+        }
+    }
 }
 
 template <bool KDA>
@@ -177,9 +304,26 @@ static void launch_gated_delta_net(
 
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    // chunked dispatch hook; launch site wired in a follow-up commit
-    const bool use_chunked = gdn_chunked_eligible((int) S_v, n_tokens, KDA, cc);
-    GGML_UNUSED(use_chunked);
+    if (gdn_chunked_eligible((int) S_v, n_tokens, KDA, cc)) {
+        dim3 ck_grid(H, n_seqs, 1);
+        dim3 ck_block(warp_size, num_warps, 1);
+        if constexpr (!KDA) {
+            if (S_v == 64) {
+                gated_delta_net_chunked_cuda<64, 64, false><<<ck_grid, ck_block, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                return;
+            }
+            if (S_v == 128) {
+                gated_delta_net_chunked_cuda<128, 32, false><<<ck_grid, ck_block, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                return;
+            }
+        }
+    }
 
     switch (S_v) {
         case 16:

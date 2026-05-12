@@ -8994,7 +8994,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
-    // chunked-path boundaries: threshold and S_v=128 prefill
+    // chunked-path boundaries: threshold-1 (fallback), threshold (chunked), S_v=128
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64, 191, 1)); // fallback (< threshold)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 191, 1)); // fallback (< threshold)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64, 192, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 192, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 2));
