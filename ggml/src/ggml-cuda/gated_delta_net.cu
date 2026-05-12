@@ -145,18 +145,31 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-// Chunked prefill dispatch validation path (non-KDA), single block per (h, seq).
-// This kernel intentionally mirrors the existing token-sequential update while
-// keeping state live across chunk boundaries. The real chunk-level MMA algorithm
-// will replace the inner per-token loop in a follow-up patch.
+// Chunked prefill (non-KDA), single block per (h, seq), CS=32 across both S_v values
+// for SMEM headroom on SM86/SM89. Algorithm follows build_delta_net_chunking in
+// src/models/delta-net-base.cpp: precompute kb/kq/attn/k_cd per chunk, then run an
+// inter-chunk inner loop over tokens using warp-cooperative dot products. MMA
+// substitution lands in a follow-up commit; this commit establishes the algorithm.
 constexpr int GDN_CHUNKED_THRESHOLD = 192; // TODO: tune via PP-{96..256} sweep
+constexpr int GDN_CHUNKED_CS        = 32;
 
 static bool gdn_chunked_eligible(int S_v, int64_t n_tokens, bool kda, int cc) {
     if (kda)                              return false; // KDA chunked is PR3
     if (n_tokens < GDN_CHUNKED_THRESHOLD) return false;
     if (S_v != 64 && S_v != 128)          return false;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return false;                                       // PR1 chunked is NV-only
+#else
     if (cc < GGML_CUDA_CC_AMPERE)         return false; // f32.tf32 MMA needs SM80+
     return true;
+#endif
+}
+
+template <int S_v, int CS>
+static constexpr size_t gdn_chunked_smem_bytes() {
+    // sm_q + sm_k + sm_v (each CS*S_v) + 4 vectors of length CS (beta/g_cs/g_exp/g_diff)
+    // + sm_kb + sm_attn + sm_kq (each CS*CS) + sm_k_cd (S_v*CS)
+    return (3 * CS * S_v + 4 * CS + 3 * CS * CS + S_v * CS) * sizeof(float);
 }
 
 template <int S_v, int CS, bool KDA>
@@ -185,9 +198,11 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
                                              float         scale) {
     static_assert(!KDA, "PR1 chunked path is non-KDA only");
     static_assert(S_v == 64 || S_v == 128, "PR1 supports S_v in {64, 128}");
+    static_assert(CS == 32, "commit 3 locks CS=32; larger CS revisited with MMA");
 
     constexpr int warp_size     = 32;
     constexpr int num_warps     = 4;
+    constexpr int tot_threads   = warp_size * num_warps;
     constexpr int cols_per_warp = S_v / num_warps;
     constexpr int rows_per_lane = S_v / warp_size;
     static_assert(cols_per_warp * num_warps == S_v, "S_v must be a multiple of num_warps");
@@ -195,6 +210,7 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
 
     const int lane     = threadIdx.x;
     const int warp_id  = threadIdx.y;
+    const int tid      = warp_id * warp_size + lane;
     const int h_idx    = blockIdx.x;
     const int sequence = blockIdx.y;
 
@@ -207,11 +223,22 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
     float *       state_out        = dst + attn_score_elems + state_offset;
     const float * state_in         = curr_state + state_offset;
 
-    // Register state: s_shard[c][r] holds S[r*warp_size + lane][warp_id*cols_per_warp + c]
-    // i.e. each warp owns cols_per_warp contiguous columns; each lane owns rows_per_lane
-    // rows of those columns via the same row-stripe as the sequential kernel.
-    float s_shard[cols_per_warp][rows_per_lane];
+    // SMEM layout
+    extern __shared__ float smem[];
+    float * sm_q      = smem;                          // CS * S_v   (chunk q, pre-scaled)
+    float * sm_k      = sm_q      + CS * S_v;          // CS * S_v
+    float * sm_v      = sm_k      + CS * S_v;          // CS * S_v   (v -> v_chunk -> v_new)
+    float * sm_beta   = sm_v      + CS * S_v;          // CS
+    float * sm_g_cs   = sm_beta   + CS;                // CS (cumsum of g, clamped)
+    float * sm_g_exp  = sm_g_cs   + CS;                // CS (= exp(g_cs))
+    float * sm_g_diff = sm_g_exp  + CS;                // CS (= exp(g_cs[CS-1] - g_cs))
+    float * sm_kb     = sm_g_diff + CS;                // CS * CS  (G1 output)
+    float * sm_attn   = sm_kb     + CS * CS;           // CS * CS  (WY solve output, + I)
+    float * sm_kq     = sm_attn   + CS * CS;           // CS * CS  (G2 output, tril)
+    float * sm_k_cd   = sm_kq     + CS * CS;           // S_v * CS (G5 output)
 
+    // Register state: same sharding as commit 2
+    float s_shard[cols_per_warp][rows_per_lane];
     #pragma unroll
     for (int c = 0; c < cols_per_warp; ++c) {
         const int col = warp_id * cols_per_warp + c;
@@ -221,58 +248,226 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
         }
     }
 
-    const int n_chunks = (n_tokens + CS - 1) / CS;
+    const int n_chunks = ((int) n_tokens + CS - 1) / CS;
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
-        const int t_start = chunk * CS;
-        const int t_end   = (int) n_tokens < t_start + CS ? (int) n_tokens : t_start + CS;
+        const int t_start   = chunk * CS;
+        const int chunk_len = ((int) n_tokens - t_start < CS) ? ((int) n_tokens - t_start) : CS;
 
-        for (int t = t_start; t < t_end; ++t) {
-            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
-
-            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-            const float   beta_val  = beta[gb_offset];
-            const float   g_val     = expf(g[gb_offset]);
-
-            float k_reg[rows_per_lane];
-            float q_reg[rows_per_lane];
-            #pragma unroll
-            for (int r = 0; r < rows_per_lane; ++r) {
-                const int i = r * warp_size + lane;
-                k_reg[r] = k_t[i];
-                q_reg[r] = q_t[i];
+        // Phase 1: load chunk q (pre-scaled), k, v, beta, g
+        for (int idx = tid; idx < CS * S_v; idx += tot_threads) {
+            const int t   = idx / S_v;
+            const int i   = idx % S_v;
+            const int t_g = t_start + t;
+            if (t < chunk_len) {
+                sm_q[idx] = q[iq3 * sq3 + t_g * sq2 + iq1 * sq1 + i] * scale;
+                sm_k[idx] = k[iq3 * sq3 + t_g * sq2 + iq1 * sq1 + i];
+                sm_v[idx] = v[sequence * sv3 + t_g * sv2 + h_idx * sv1 + i];
+            } else {
+                sm_q[idx] = 0.0f;
+                sm_k[idx] = 0.0f;
+                sm_v[idx] = 0.0f;
             }
+        }
+        if (tid < CS) {
+            const int t_g = t_start + tid;
+            if (tid < chunk_len) {
+                const int64_t gb_off = sequence * sb3 + t_g * sb2 + h_idx * sb1;
+                sm_beta[tid] = beta[gb_off];
+                sm_g_cs[tid] = g[gb_off];
+            } else {
+                sm_beta[tid] = 0.0f;
+                sm_g_cs[tid] = 0.0f;
+            }
+        }
+        __syncthreads();
 
-            float * attn_data_t = attn_data_base + t * S_v * H;
+        // Phase 2: g_cs = clamp(cumsum(g), 50); g_exp = exp(g_cs); g_diff = exp(g_cs[last] - g_cs)
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (int t = 0; t < CS; ++t) {
+                acc += sm_g_cs[t];
+                if (acc > 50.0f) acc = 50.0f;
+                sm_g_cs[t]  = acc;
+                sm_g_exp[t] = expf(acc);
+            }
+            const float g_last_log = sm_g_cs[CS - 1];
+            for (int t = 0; t < CS; ++t) {
+                sm_g_diff[t] = expf(fminf(g_last_log - sm_g_cs[t], 50.0f));
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: G1   kb[i, j] = decay[i, j] * sum_d (k[i, d] * beta[i]) * k[j, d]   for j <= i
+        for (int idx = tid; idx < CS * CS; idx += tot_threads) {
+            const int i = idx / CS;
+            const int j = idx % CS;
+            float val = 0.0f;
+            if (j <= i) {
+                const float decay = expf(fminf(sm_g_cs[j] - sm_g_cs[i], 50.0f));
+                float dot = 0.0f;
+                for (int d = 0; d < S_v; ++d) {
+                    dot += sm_k[i * S_v + d] * sm_k[j * S_v + d];
+                }
+                val = dot * sm_beta[i] * decay;
+            }
+            sm_kb[idx] = val;
+        }
+        __syncthreads();
+
+        // Phase 4: G2   kq[i, j] = decay[i, j] * sum_d q[i, d] * k[j, d]   for j <= i (tril)
+        for (int idx = tid; idx < CS * CS; idx += tot_threads) {
+            const int i = idx / CS;
+            const int j = idx % CS;
+            float val = 0.0f;
+            if (j <= i) {
+                const float decay = expf(fminf(sm_g_cs[j] - sm_g_cs[i], 50.0f));
+                float dot = 0.0f;
+                for (int d = 0; d < S_v; ++d) {
+                    dot += sm_q[i * S_v + d] * sm_k[j * S_v + d];
+                }
+                val = dot * decay;
+            }
+            sm_kq[idx] = val;
+        }
+        __syncthreads();
+
+        // Phase 5: G3   WY solve.  attn = solve_tri(I + tril(kb,-1), -tril(kb,-1)) + I
+        //   - lhs[r, k]  = kb[r, k] for k < r,  1 if k == r,  0 otherwise (diag handled implicitly)
+        //   - rhs[r, c]  = -kb[r, c] for c < r,  0 otherwise
+        //   - X[r, c]   := rhs[r, c] - sum_{k<r} kb[r, k] * X[k, c]   (diag of lhs is 1)
+        //   - attn       = X + I
+        for (int idx = tid; idx < CS * CS; idx += tot_threads) {
+            const int i = idx / CS;
+            const int j = idx % CS;
+            sm_attn[idx] = (j < i) ? -sm_kb[idx] : 0.0f;
+        }
+        __syncthreads();
+
+        // Sequential forward substitution. CS=32 columns map to one warp; row-by-row update.
+        if (warp_id == 0) {
+            for (int r = 1; r < CS; ++r) {
+                const int c = lane; // CS == warp_size == 32
+                float x = sm_attn[r * CS + c];
+                for (int kk = 0; kk < r; ++kk) {
+                    x -= sm_kb[r * CS + kk] * sm_attn[kk * CS + c];
+                }
+                sm_attn[r * CS + c] = x;
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+        if (tid < CS) {
+            sm_attn[tid * CS + tid] += 1.0f;  // attn = X + I
+        }
+        __syncthreads();
+
+        // Phase 6: G4   v_chunk[t, d] = sum_j attn[t, j] * v_b[j, d],  v_b[j, d] = v[j, d] * beta[j]
+        // In-place rewrite of sm_v (two-pass via registers to avoid intra-block races).
+        constexpr int per_thread_v = (CS * S_v + tot_threads - 1) / tot_threads;
+        float v_chunk_reg[per_thread_v];
+        #pragma unroll
+        for (int p = 0; p < per_thread_v; ++p) {
+            const int idx = tid + p * tot_threads;
+            float acc = 0.0f;
+            if (idx < CS * S_v) {
+                const int t = idx / S_v;
+                const int d = idx % S_v;
+                for (int j = 0; j < CS; ++j) {
+                    acc += sm_attn[t * CS + j] * sm_v[j * S_v + d] * sm_beta[j];
+                }
+            }
+            v_chunk_reg[p] = acc;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int p = 0; p < per_thread_v; ++p) {
+            const int idx = tid + p * tot_threads;
+            if (idx < CS * S_v) {
+                sm_v[idx] = v_chunk_reg[p];
+            }
+        }
+        __syncthreads();
+
+        // Phase 7: G5   k_cd[d, i] = sum_j (k[j, d] * beta[j] * g_exp[j]) * attn[j, i]
+        for (int idx = tid; idx < S_v * CS; idx += tot_threads) {
+            const int d = idx / CS;
+            const int i = idx % CS;
+            float acc = 0.0f;
+            for (int j = 0; j < CS; ++j) {
+                acc += sm_k[j * S_v + d] * sm_beta[j] * sm_g_exp[j] * sm_attn[j * CS + i];
+            }
+            sm_k_cd[idx] = acc;
+        }
+        __syncthreads();
+
+        // Phase 8: inter-chunk inner loop.  For each t in chunk:
+        //   v_prime[col]    = sum_d k_cd[d, t] * S[d, col]
+        //   v_new[t, col]   = v_chunk[t, col] - v_prime[col]                (overwrites sm_v[t, col])
+        //   attn_inter[col] = g_exp[t] * sum_d q[t, d] * S[d, col]          (with pre-scaled q)
+        //   v_attn[col]     = sum_{j<=t} kq[t, j] * v_new[j, col]
+        //   output[t, col]  = attn_inter[col] + v_attn[col]
+        for (int t = 0; t < chunk_len; ++t) {
+            const float   g_exp_t     = sm_g_exp[t];
+            float *       attn_data_t = attn_data_base + (t_start + t) * S_v * H;
+            float         attn_inter_reg[cols_per_warp];
 
             #pragma unroll
             for (int c = 0; c < cols_per_warp; ++c) {
                 const int col = warp_id * cols_per_warp + c;
 
-                float kv_shard = 0.0f;
+                float vp = 0.0f;
+                float ai = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < rows_per_lane; ++r) {
-                    kv_shard += s_shard[c][r] * k_reg[r];
+                    const int d = r * warp_size + lane;
+                    vp += sm_k_cd[d * CS + t] * s_shard[c][r];
+                    ai += sm_q[t * S_v + d]   * s_shard[c][r];
                 }
-                const float kv_col    = warp_reduce_sum<warp_size>(kv_shard);
-                const float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
-
-                float attn_partial = 0.0f;
-                #pragma unroll
-                for (int r = 0; r < rows_per_lane; ++r) {
-                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
-                    attn_partial += s_shard[c][r] * q_reg[r];
-                }
-                const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                const float vp_col = warp_reduce_sum<warp_size>(vp);
+                attn_inter_reg[c]  = warp_reduce_sum<warp_size>(ai) * g_exp_t;
 
                 if (lane == 0) {
-                    attn_data_t[col] = attn_col * scale;
+                    sm_v[t * S_v + col] -= vp_col;  // sm_v[t, col] was v_chunk -> now v_new
+                }
+            }
+            __syncthreads();  // ensure v_new[t, *] visible across warps for v_attn read
+
+            #pragma unroll
+            for (int c = 0; c < cols_per_warp; ++c) {
+                const int col = warp_id * cols_per_warp + c;
+
+                float va = 0.0f;
+                for (int j = lane; j <= t; j += warp_size) {
+                    va += sm_kq[t * CS + j] * sm_v[j * S_v + col];
+                }
+                const float v_attn_col = warp_reduce_sum<warp_size>(va);
+
+                if (lane == 0) {
+                    attn_data_t[col] = attn_inter_reg[c] + v_attn_col;
                 }
             }
         }
+        __syncthreads();
+
+        // Phase 9: G9   S[d, col] = g_last * S[d, col] + sum_t (k[t, d] * g_diff[t]) * v_new[t, col]
+        const float g_last = sm_g_exp[CS - 1];
+        #pragma unroll
+        for (int c = 0; c < cols_per_warp; ++c) {
+            const int col = warp_id * cols_per_warp + c;
+            #pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int d   = r * warp_size + lane;
+                float     kgv = 0.0f;
+                for (int t = 0; t < chunk_len; ++t) {
+                    kgv += sm_k[t * S_v + d] * sm_g_diff[t] * sm_v[t * S_v + col];
+                }
+                s_shard[c][r] = g_last * s_shard[c][r] + kgv;
+            }
+        }
+        __syncthreads();
     }
 
+    // Write final state back to gmem (transposed layout, matches sequential)
     #pragma unroll
     for (int c = 0; c < cols_per_warp; ++c) {
         const int col = warp_id * cols_per_warp + c;
@@ -305,24 +500,35 @@ static void launch_gated_delta_net(
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if (gdn_chunked_eligible((int) S_v, n_tokens, KDA, cc)) {
+        const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
         dim3 ck_grid(H, n_seqs, 1);
         dim3 ck_block(warp_size, num_warps, 1);
+        constexpr int CS = GDN_CHUNKED_CS;
         if constexpr (!KDA) {
             if (S_v == 64) {
-                gated_delta_net_chunked_cuda<64, 64, false><<<ck_grid, ck_block, 0, stream>>>(
-                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-                return;
+                constexpr size_t smem = gdn_chunked_smem_bytes<64, CS>();
+                if (smem <= smpbo) {
+                    CUDA_SET_SHARED_MEMORY_LIMIT((gated_delta_net_chunked_cuda<64, CS, false>), smem);
+                    gated_delta_net_chunked_cuda<64, CS, false><<<ck_grid, ck_block, smem, stream>>>(
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    return;
+                }
             }
             if (S_v == 128) {
-                gated_delta_net_chunked_cuda<128, 32, false><<<ck_grid, ck_block, 0, stream>>>(
-                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-                return;
+                constexpr size_t smem = gdn_chunked_smem_bytes<128, CS>();
+                if (smem <= smpbo) {
+                    CUDA_SET_SHARED_MEMORY_LIMIT((gated_delta_net_chunked_cuda<128, CS, false>), smem);
+                    gated_delta_net_chunked_cuda<128, CS, false><<<ck_grid, ck_block, smem, stream>>>(
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    return;
+                }
             }
         }
+        // smem > smpbo on this device — fall through to sequential
     }
 
     switch (S_v) {
