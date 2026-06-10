@@ -298,12 +298,14 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
         __syncthreads();
 
         // Phase 3: G1   kb[i, j] = decay[i, j] * sum_d (k[i, d] * beta[i]) * k[j, d]   for j <= i
+        //   decay[i, j] = exp(g_cs[i] - g_cs[j]) so older keys (j < i) attenuate; this matches
+        //   delta-net-base.cpp where the ggml layout puts the query position on the row axis.
         for (int idx = tid; idx < CS * CS; idx += tot_threads) {
             const int i = idx / CS;
             const int j = idx % CS;
             float val = 0.0f;
             if (j <= i) {
-                const float decay = expf(fminf(sm_g_cs[j] - sm_g_cs[i], 50.0f));
+                const float decay = expf(fminf(sm_g_cs[i] - sm_g_cs[j], 50.0f));
                 float dot = 0.0f;
                 for (int d = 0; d < S_v; ++d) {
                     dot += sm_k[i * S_v + d] * sm_k[j * S_v + d];
@@ -320,7 +322,7 @@ __global__ void gated_delta_net_chunked_cuda(const float * q,
             const int j = idx % CS;
             float val = 0.0f;
             if (j <= i) {
-                const float decay = expf(fminf(sm_g_cs[j] - sm_g_cs[i], 50.0f));
+                const float decay = expf(fminf(sm_g_cs[i] - sm_g_cs[j], 50.0f));
                 float dot = 0.0f;
                 for (int d = 0; d < S_v; ++d) {
                     dot += sm_q[i * S_v + d] * sm_k[j * S_v + d];
