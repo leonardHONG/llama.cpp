@@ -1352,6 +1352,17 @@ struct test_case {
             return test_status_t::SKIPPED;
         }
 
+        ggml_backend_buffer_type_t weight_buft = nullptr;
+        if (ctx_weights) {
+            weight_buft = weight_buffer_type(backend1);
+            if (weight_buft == nullptr) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                                   false, false, "weight buffer not supported");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::NOT_SUPPORTED;
+            }
+        }
+
         // check if the backends support the ops
         bool supported = true;
         std::string unsupported_str;
@@ -1386,7 +1397,7 @@ struct test_case {
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(
-                ctx_weights.get(), weight_buffer_type(backend1)));
+                ctx_weights.get(), weight_buft));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -1534,6 +1545,17 @@ struct test_case {
             return true;
         }
 
+        ggml_backend_buffer_type_t weight_buft = nullptr;
+        if (ctx_weights) {
+            weight_buft = weight_buffer_type(backend);
+            if (weight_buft == nullptr) {
+                test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf",
+                                   false, false, "weight buffer not supported");
+                output_printer->print_test_result(result);
+                return true;
+            }
+        }
+
         if (!ggml_backend_supports_op(backend, out)) {
             // Create test result for unsupported performance test
             test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
@@ -1547,7 +1569,7 @@ struct test_case {
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(
-                ctx_weights.get(), weight_buffer_type(backend)));
+                ctx_weights.get(), weight_buft));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
@@ -1670,17 +1692,21 @@ struct test_case {
         };
         ggml_context_ptr ctx(ggml_init(params)); // smart ptr
         GGML_ASSERT(ctx);
+        const bool use_weights = use_weight_context();
+        ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
+        GGML_ASSERT(!use_weights || ctx_weights);
 
         gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
 
-        ggml_tensor * out = build_graph(ctx.get());
+        ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
         current_op_name   = op_desc(out);
 
         if (!matches_filter(out, op_names_filter)) {
             return true;
         }
 
-        bool supported = ggml_backend_supports_op(backend, out);
+        bool supported = (!ctx_weights || weight_buffer_type(backend) != nullptr) &&
+            ggml_backend_supports_op(backend, out);
 
         std::string device_desc = ggml_backend_dev_description(ggml_backend_get_device(backend));
         std::string backend_reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
@@ -4360,6 +4386,81 @@ struct test_mul_mat : public test_case {
     }
 };
 
+static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return nullptr;
+    }
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts != nullptr) {
+        for (ggml_backend_buffer_type_t * bufts = get_extra_bufts(dev);
+             bufts != nullptr && *bufts != nullptr; ++bufts) {
+            if (strstr(ggml_backend_buft_name(*bufts), "_REPACK") != nullptr) {
+                return *bufts;
+            }
+        }
+    }
+    return nullptr;
+}
+
+struct test_repacked_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_repacked_mul_mat(ggml_type type, int64_t m, int64_t n, int64_t k) :
+        type(type), m(m), n(n), k(k) {
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_NVFP4 ? 4e-2 : 2e-2;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    bool use_weight_context() override {
+        return true;
+    }
+
+    bool use_weight_context_sentinels() override {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        ggml_tensor * weight = ::ggml_new_tensor_2d(ctx_weights, type, k, m);
+        ggml_set_name(weight, "weight");
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(input, "input");
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK";
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -4497,321 +4598,6 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
-    }
-};
-
-static ggml_backend_buffer_type_t cutlass_test_weight_buffer_type(ggml_backend_t backend) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
-    if (get_extra_bufts != nullptr) {
-        for (ggml_backend_buffer_type_t * bufts = get_extra_bufts(dev); bufts != nullptr && *bufts != nullptr;
-             ++bufts) {
-            if (strstr(ggml_backend_buft_name(*bufts), "_CUTLASS") != nullptr) {
-                return *bufts;
-            }
-        }
-    }
-    return ggml_backend_get_default_buffer_type(backend);
-}
-
-struct test_moe_nvfp4_block : public test_case {
-    const int64_t n_token;
-    const bool compare_baseline;
-    const bool views_first;
-    const bool skewed_ids;
-    const bool shared_output;
-
-    test_moe_nvfp4_block(
-            int64_t n_token, bool compare_baseline = false, bool views_first = false,
-            bool skewed_ids = false, bool shared_output = false) :
-        n_token(n_token), compare_baseline(compare_baseline), views_first(views_first),
-        skewed_ids(skewed_ids), shared_output(shared_output) {
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "MOE_NVFP4_BLOCK";
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR5(n_token, compare_baseline, views_first, skewed_ids, shared_output);
-    }
-
-    double max_nmse_err() override {
-        return compare_baseline ? 1.0 : 5e-4;
-    }
-
-    double max_nmse_err(ggml_backend_t backend) override {
-        if (compare_baseline) {
-            return 1.0;
-        }
-        return backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") ? 4e-2 : max_nmse_err();
-    }
-
-    double err(const float * reference, const float * actual, size_t n) override {
-        if (!compare_baseline) {
-            return nmse(reference, actual, n);
-        }
-
-        GGML_ASSERT(n % 2 == 0);
-        const size_t half = n / 2;
-        return std::max({
-            nmse(reference, actual, half) / 4e-2,
-            nmse(reference + half, actual + half, half) / 4e-2,
-            nmse(actual, actual + half, half) / 4e-2,
-        });
-    }
-
-    bool run_whole_graph() override {
-        return true;
-    }
-
-    bool use_weight_context() override {
-        return true;
-    }
-
-    bool use_weight_context_sentinels() override {
-        return false;
-    }
-
-    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
-        return cutlass_test_weight_buffer_type(backend);
-    }
-
-    uint64_t op_flops(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        constexpr uint64_t n_embd = 2048;
-        constexpr uint64_t n_ff = 512;
-        constexpr uint64_t n_expert_used = 8;
-        return 2ULL * n_expert_used * n_token * n_embd * (2 * n_ff + n_ff);
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        GGML_UNUSED(ctx);
-        GGML_ABORT("CUTLASS MoE test requires a weight context");
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        GGML_ASSERT(ctx_weights != nullptr);
-        constexpr int64_t n_expert = 256;
-        constexpr int64_t n_expert_used = 8;
-        constexpr int64_t n_embd = 2048;
-        constexpr int64_t n_ff = 512;
-
-        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_token);
-        ggml_set_name(ids_all, "ids_all");
-        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_expert_used, n_token, ids_all->nb[1], 0);
-        ggml_set_name(ids, "ids");
-
-        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_token);
-        ggml_set_name(input, "input");
-        ggml_tensor * gate = ::ggml_new_tensor_3d(ctx_weights, GGML_TYPE_NVFP4, n_embd, n_ff, n_expert);
-        ggml_set_name(gate, "gate");
-        ggml_tensor * up = ::ggml_new_tensor_3d(ctx_weights, GGML_TYPE_NVFP4, n_embd, n_ff, n_expert);
-        ggml_set_name(up, "up");
-        ggml_tensor * down = ::ggml_new_tensor_3d(ctx_weights, GGML_TYPE_NVFP4, n_ff, n_embd, n_expert);
-        ggml_set_name(down, "down");
-
-        ggml_tensor * gate_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
-        ggml_set_name(gate_scale, "gate_scale");
-        ggml_tensor * up_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
-        ggml_set_name(up_scale, "up_scale");
-        ggml_tensor * down_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
-        ggml_set_name(down_scale, "down_scale");
-        ggml_tensor * route_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_token);
-        ggml_set_name(route_weights, "route_weights");
-
-        auto select_scale = [&](ggml_tensor * scale) {
-            ggml_tensor * selected = ggml_reshape_3d(ctx, scale, 1, n_expert, 1);
-            selected = ggml_repeat_4d(ctx, selected, 1, n_expert, n_token, 1);
-            return ggml_get_rows(ctx, selected, ids);
-        };
-
-        auto mul_mat_id = [&](ggml_tensor * weight, ggml_tensor * activation,
-                              ggml_tensor * scale, bool block_fusion) {
-            ggml_tensor * result = ggml_mul_mat_id(ctx, weight, activation, ids);
-            if (block_fusion) {
-                result = ggml_cont(ctx, result);
-            }
-            return ggml_mul(ctx, result, select_scale(scale));
-        };
-
-        auto build_moe = [&](bool allow_fusion) {
-            ggml_tensor * gate_out = mul_mat_id(gate, input, gate_scale, !allow_fusion);
-            ggml_tensor * up_out = mul_mat_id(up, input, up_scale, false);
-            ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_out, up_out);
-            ggml_tensor * expert_out = mul_mat_id(down, hidden, down_scale, false);
-            expert_out = ggml_mul(ctx, expert_out, route_weights);
-
-            std::array<ggml_tensor *, n_expert_used> routes;
-            for (int64_t i = 0; i < n_expert_used; ++i) {
-                routes[i] = ggml_view_2d(
-                    ctx, expert_out, n_embd, n_token, expert_out->nb[2], i * expert_out->nb[1]);
-                if (views_first) {
-                    ggml_build_forward_expand(gf, routes[i]);
-                }
-            }
-            ggml_tensor * result = routes[0];
-            for (int64_t i = 1; i < n_expert_used; ++i) {
-                result = ggml_add(ctx, result, routes[i]);
-            }
-            result = ggml_cont(ctx, result);
-            if (shared_output) {
-                ggml_tensor * shared = ggml_reshape_2d(ctx, input, n_embd, n_token);
-                shared = ggml_scale(ctx, shared, 0.125f);
-                result = ggml_add(ctx, result, shared);
-            }
-            return result;
-        };
-
-        ggml_tensor * result = build_moe(true);
-        if (compare_baseline) {
-            result = ggml_concat(ctx, build_moe(false), result, 1);
-        }
-        ggml_set_name(result, "out");
-        return result;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, 256);
-
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "input") == 0) {
-                init_tensor_uniform(t, -0.25f, 0.25f);
-            } else if (strstr(t->name, "_scale") != nullptr) {
-                std::vector<float> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = 0.25f * (1.0f + float(i % 13) / 64.0f);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (strcmp(t->name, "route_weights") == 0) {
-                std::vector<float> data(ggml_nelements(t), 1.0f / 8.0f);
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (strcmp(t->name, "ids_all") == 0) {
-                std::vector<int32_t> row(ggml_nelements(t) / n_token);
-                for (int64_t token = 0; token < n_token; ++token) {
-                    for (int64_t slot = 0; slot < 8; ++slot) {
-                        row[slot] = skewed_ids ? (int32_t) slot : (int32_t) ((token * 13 + slot * 29) % 256);
-                    }
-                    ggml_backend_tensor_set(t, row.data(), token * t->nb[1], row.size() * sizeof(int32_t));
-                }
-            }
-        }
-    }
-};
-
-struct test_cutlass_ffn_block : public test_case {
-    const ggml_type type;
-    const int64_t n_token;
-
-    test_cutlass_ffn_block(ggml_type type, int64_t n_token) : type(type), n_token(n_token) {
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "CUTLASS_FFN_BLOCK";
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR2(type, n_token);
-    }
-
-    double max_nmse_err() override {
-        return 1.0;
-    }
-
-    double err(const float * reference, const float * actual, size_t n) override {
-        GGML_ASSERT(n % 2 == 0);
-        const size_t half = n / 2;
-        const double tolerance = type == GGML_TYPE_NVFP4 ? 4e-2 : 2e-2;
-        return std::max({
-            nmse(reference, actual, half) / tolerance,
-            nmse(reference + half, actual + half, half) / tolerance,
-            nmse(actual, actual + half, half) / tolerance,
-        });
-    }
-
-    bool run_whole_graph() override {
-        return true;
-    }
-
-    bool use_weight_context() override {
-        return true;
-    }
-
-    bool use_weight_context_sentinels() override {
-        return false;
-    }
-
-    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
-        return cutlass_test_weight_buffer_type(backend);
-    }
-
-    uint64_t op_flops(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        constexpr uint64_t n_embd = 256;
-        constexpr uint64_t n_ff = 256;
-        return 2ULL * n_token * n_embd * (2 * n_ff + n_ff);
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        GGML_UNUSED(ctx);
-        GGML_ABORT("CUTLASS FFN test requires a weight context");
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        GGML_ASSERT(ctx_weights != nullptr);
-        constexpr int64_t n_embd = 256;
-        constexpr int64_t n_ff = 256;
-
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_token);
-        ggml_set_name(input, "input");
-        ggml_tensor * decode_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
-        ggml_set_name(decode_input, "decode_input");
-        ggml_tensor * gate = ::ggml_new_tensor_2d(ctx_weights, type, n_embd, n_ff);
-        ggml_set_name(gate, "gate");
-        ggml_tensor * up = ::ggml_new_tensor_2d(ctx_weights, type, n_embd, n_ff);
-        ggml_set_name(up, "up");
-        ggml_tensor * down = ::ggml_new_tensor_2d(ctx_weights, type, n_ff, n_embd);
-        ggml_set_name(down, "down");
-        ggml_tensor * gate_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(gate_scale, "gate_scale");
-        ggml_tensor * up_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(up_scale, "up_scale");
-        ggml_tensor * down_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(down_scale, "down_scale");
-
-        auto build_ffn = [&](bool allow_fusion) {
-            ggml_tensor * up_out = ggml_mul(ctx, ggml_mul_mat(ctx, up, input), up_scale);
-            if (!allow_fusion) {
-                up_out = ggml_cont(ctx, up_out);
-            }
-            ggml_tensor * gate_out = ggml_mul(ctx, ggml_mul_mat(ctx, gate, input), gate_scale);
-            ggml_tensor * hidden = ggml_swiglu_split(ctx, gate_out, up_out);
-            return ggml_mul(ctx, ggml_mul_mat(ctx, down, hidden), down_scale);
-        };
-
-        ggml_tensor * baseline = build_ffn(false);
-        ggml_tensor * candidate = build_ffn(true);
-        ggml_tensor * decode = ggml_mul_mat(ctx, gate, decode_input);
-        ggml_tensor * decode_zero = ggml_scale(ctx, ggml_sum(ctx, decode), 0.0f);
-        candidate = ggml_add(ctx, candidate, decode_zero);
-        ggml_tensor * result = ggml_concat(ctx, candidate, baseline, 1);
-        ggml_set_name(result, "out");
-        return result;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (strstr(t->name, "_scale") == nullptr) {
-                init_tensor_uniform(t);
-            } else {
-                const float scale = 0.25f;
-                ggml_backend_tensor_set(t, &scale, 0, sizeof(scale));
-            }
-        }
     }
 };
 
@@ -10073,19 +9859,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    if (getenv("GGML_CUDA_CUTLASS_TEST") != nullptr) {
-        test_cases.emplace_back(
-            new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 512, 256, 256, {1, 1}, {1, 1}));
-        test_cases.emplace_back(
-            new test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 512, 256, 256, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_cutlass_ffn_block(GGML_TYPE_MXFP4, 256));
-        test_cases.emplace_back(new test_cutlass_ffn_block(GGML_TYPE_NVFP4, 256));
-
-        test_cases.emplace_back(new test_moe_nvfp4_block(512));
-        test_cases.emplace_back(new test_moe_nvfp4_block(512, true));
-        test_cases.emplace_back(new test_moe_nvfp4_block(512, true, true));
-        test_cases.emplace_back(new test_moe_nvfp4_block(512, true, true, true));
-        test_cases.emplace_back(new test_moe_nvfp4_block(1024, true, true, true, true));
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 1, 512));
+        test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 256, 512));
     }
 
     return test_cases;
@@ -10104,18 +9880,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n_tokens : {512, 2048}) {
             test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, type, { 2*17408, n_tokens, 1, 1 }, 0, false));
             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
-        }
-    }
-
-    if (getenv("GGML_CUDA_CUTLASS_TEST") != nullptr) {
-        for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
-            for (int64_t n_token : {512, 2048, 8192}) {
-                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n_token, 2048,
-                                                         {1, 1}, {1, 1}));
-            }
-        }
-        for (int64_t n_token : {512, 2048, 8192}) {
-            test_cases.emplace_back(new test_moe_nvfp4_block(n_token));
         }
     }
 
@@ -10458,6 +10222,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        for (int64_t n : {512, 2048, 8192}) {
+            test_cases.emplace_back(new test_repacked_mul_mat(type, 2048, n, 2048));
         }
     }
 

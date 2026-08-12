@@ -200,7 +200,7 @@ option(GGML_CUDA                            "ggml: use CUDA"                    
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
-option(GGML_CUDA_CUTLASS                    "ggml: build the experimental CUTLASS path"       OFF)
+option(GGML_CUDA_CUTLASS                    "ggml: build CUTLASS kernels"                     OFF)
 set   (GGML_CUDA_CUTLASS_PATH "" CACHE PATH
                                             "ggml: path to a CUTLASS source tree")
 set   (GGML_CUDA_CUTLASS_REVISION "b46b16d003484063bca4ed365e44095c4c6ed633" CACHE STRING

@@ -660,8 +660,6 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
-    const int64_t cutlass_kbx_offset = (int64_t) sample_x * stride_sample_x +
-        (int64_t) channel_x * stride_channel_x + (int64_t) row0 * stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -676,7 +674,9 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (cutlass_layout) {
                     tmp[j][i] += vec_dot_cutlass_q8_1<type>(
                         (const uint8_t *) vx, vx_scales, &y[j*stride_col_y + kby],
-                        cutlass_kbx_offset + i*stride_row_x + kbx, row0 + i, channel_x, kbx, kqs,
+                        (int64_t) sample_x * stride_sample_x + (int64_t) channel_x * stride_channel_x +
+                            (int64_t) (row0 + i) * stride_row_x + kbx,
+                        row0 + i, channel_x, kbx, kqs,
                         padded_scale_blocks, scale_stride);
                 } else {
                     tmp[j][i] += vec_dot_q_cuda(
@@ -783,16 +783,15 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool cutlass_layout = false>
+template <ggml_type type, int c_rows_per_block>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
-        const void * vx_ptr, const uint8_t * vx_scales, const void * vy_ptr, const int32_t * ids_ptr,
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
         float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int padded_scale_blocks, const int scale_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -822,8 +821,6 @@ static __global__ void mul_mat_vec_q_moe(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset = channel_x*stride_channel_x + row0*stride_row_x;
-    const int64_t cutlass_kbx_offset = (int64_t) channel_x * stride_channel_x +
-        (int64_t) row0 * stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -834,13 +831,7 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            if constexpr (cutlass_layout) {
-                tmp[i] += vec_dot_cutlass_q8_1<type>(
-                    (const uint8_t *) vx, vx_scales, &y[kby], cutlass_kbx_offset + i*stride_row_x + kbx,
-                    row0 + i, channel_x, kbx, kqs, padded_scale_blocks, scale_stride);
-            } else {
-                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            }
+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
         }
     }
 
@@ -905,14 +896,13 @@ static void mul_mat_vec_q_switch_fusion(
         padded_scale_blocks, scale_stride);
 }
 
-template <ggml_type type, bool cutlass_layout = false>
+template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
-        const void * vx, const uint8_t * vx_scales, const void * vy, const int32_t * ids, float * dst,
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int padded_scale_blocks, const int scale_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
@@ -921,11 +911,11 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, cutlass_layout>, launch_params,
-        vx, vx_scales, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
+        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, padded_scale_blocks, scale_stride);
+        ncols_dst, ids_stride);
 }
 
 template <ggml_type type, bool cutlass_layout = false>
@@ -997,11 +987,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
-        mul_mat_vec_q_moe_launch<type, cutlass_layout>(
-            vx, vx_scales, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+        mul_mat_vec_q_moe_launch<type>(
+            vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, padded_scale_blocks, scale_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
         return;
     }
 
@@ -1344,7 +1334,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-        !ggml_backend_buft_is_cuda_cutlass(ggml_backend_buffer_get_type(src0->buffer))) {
+        !ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(src0->buffer))) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
@@ -1391,6 +1381,7 @@ void ggml_cuda_mul_mat_vec_q(
     int padded_scale_blocks = 0;
     int scale_stride = 0;
     if (cutlass_layout) {
+        GGML_ASSERT(ids == nullptr && fusion == nullptr);
         const int qk = src0->type == GGML_TYPE_NVFP4 ? QK_NVFP4 : QK_MXFP4;
         const int scale_vector_size = src0->type == GGML_TYPE_NVFP4 ? QK_NVFP4_SUB : QK_MXFP4;
         s01 = cutlass_weight.k / qk;

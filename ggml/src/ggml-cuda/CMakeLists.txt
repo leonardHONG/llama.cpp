@@ -304,7 +304,7 @@ if (CUDAToolkit_FOUND)
     else()
         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
         # https://github.com/NVIDIA/cccl/pull/6827
-        list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor /bigobj)
+        list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
     endif()
 
     list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument

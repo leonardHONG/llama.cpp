@@ -1639,20 +1639,6 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 
 #endif //defined(GGML_CUDA_USE_PDL)
 
-static bool ggml_cuda_kernel_should_use_pdl(const void * kernel) {
-#if defined(GGML_CUDA_USE_PDL)
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_CUDA_PDL");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-
-    return enabled && ggml_cuda_kernel_can_use_pdl(kernel);
-#else
-    GGML_UNUSED(kernel);
-    return false;
-#endif
-}
-
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
 # if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
 # define GGML_CUDA_RESTRICT
@@ -1663,7 +1649,13 @@ static bool ggml_cuda_kernel_should_use_pdl(const void * kernel) {
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
 #if defined(GGML_CUDA_USE_PDL)
-    if (ggml_cuda_kernel_should_use_pdl(reinterpret_cast<const void *>(kernel))) {
+
+    static const bool env_pdl_enabled = []() {
+        const char * env = getenv("GGML_CUDA_PDL");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+
+    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
         auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
 
         CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
