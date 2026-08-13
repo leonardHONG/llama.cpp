@@ -129,24 +129,16 @@ if (CUDAToolkit_FOUND)
         if (CUDAToolkit_VERSION VERSION_LESS "12.9")
             message(FATAL_ERROR "GGML_CUDA_CUTLASS requires CUDA 12.9 or newer")
         endif()
-        if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
-            message(FATAL_ERROR
-                "GGML_CUDA_CUTLASS requires GGML_CUDA_CUTLASS_PATH to point to a CUTLASS source tree")
-        endif()
-        find_package(Git QUIET)
-        if (NOT GIT_FOUND)
-            message(FATAL_ERROR "GGML_CUDA_CUTLASS requires Git to verify the CUTLASS revision")
-        endif()
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${GGML_CUDA_CUTLASS_PATH}" rev-parse HEAD
-            OUTPUT_VARIABLE GGML_CUDA_CUTLASS_REVISION_FOUND
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE GGML_CUDA_CUTLASS_REVISION_RESULT)
-        if (NOT GGML_CUDA_CUTLASS_REVISION_RESULT EQUAL 0 OR
-            NOT "${GGML_CUDA_CUTLASS_REVISION_FOUND}" STREQUAL "${GGML_CUDA_CUTLASS_REVISION}")
-            message(FATAL_ERROR
-                "GGML_CUDA_CUTLASS_PATH must be checked out at ${GGML_CUDA_CUTLASS_REVISION}; found ${GGML_CUDA_CUTLASS_REVISION_FOUND}")
-        endif()
+
+        include(FetchContent)
+        FetchContent_Declare(
+            CUTLASS
+            GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+            GIT_TAG        b46b16d003484063bca4ed365e44095c4c6ed633
+            GIT_PROGRESS   TRUE
+            SOURCE_SUBDIR  source-only
+        )
+        FetchContent_MakeAvailable(CUTLASS)
 
         list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_SOURCE}")
     endif()
@@ -217,8 +209,8 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda-cutlass PRIVATE ggml-base)
         target_include_directories(ggml-cuda-cutlass PRIVATE
             ..
-            "${GGML_CUDA_CUTLASS_PATH}/include"
-            "${GGML_CUDA_CUTLASS_PATH}/tools/util/include")
+            "${cutlass_SOURCE_DIR}/include"
+            "${cutlass_SOURCE_DIR}/tools/util/include")
         target_compile_definitions(ggml-cuda-cutlass PRIVATE GGML_CUDA_CUTLASS)
         target_compile_options(ggml-cuda-cutlass PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120f,code=sm_120f>"
