@@ -4,11 +4,13 @@
 
 bool ggml_cuda_cutlass_mul_mat_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    constexpr int output_alignment = 4;
+
     if (!ggml_cuda_cutlass_weight_supported(src0) || src1 == nullptr || dst == nullptr ||
         src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src0->ne[2] != 1 || src0->ne[3] != 1 ||
         src0->ne[0] <= 0 || src0->ne[0] > INT_MAX - 127 ||
-        src0->ne[1] <= 0 || src0->ne[1] > INT_MAX ||
+        src0->ne[1] <= 0 || src0->ne[1] > INT_MAX || src0->ne[1] % output_alignment != 0 ||
         src1->ne[0] != src0->ne[0] ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;

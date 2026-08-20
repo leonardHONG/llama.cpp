@@ -2014,14 +2014,43 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(
+        const ggml_tensor * tensor,
+        const ggml_tensor * gate = nullptr,
+        const ggml_tensor * glu = nullptr) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (src0->buffer != nullptr &&
-        ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(src0->buffer))) {
+    const bool src0_repacked = src0->buffer != nullptr &&
+        ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(src0->buffer));
+    const bool gate_repacked = gate != nullptr && gate->buffer != nullptr &&
+        ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(gate->buffer));
+    if (glu != nullptr && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI &&
+        (ggml_get_op_params_f32(glu, 2) != 1.702f || ggml_get_op_params_f32(glu, 3) != 7.0f)) {
         return false;
+    }
+    if (src0_repacked || gate_repacked) {
+        if (tensor->op != GGML_OP_MUL_MAT || !src0_repacked || (gate != nullptr && !gate_repacked) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            src0->ne[0] > INT_MAX || src0->ne[1] > INT_MAX ||
+            ggml_nelements(src1) > UINT_MAX || ggml_nelements(dst) > UINT_MAX) {
+            return false;
+        }
+
+        ggml_cuda_cutlass_weight src0_weight;
+        if (!ggml_cuda_cutlass_weight_from_tensor(src0, src0_weight) || src0_weight.scales_linear == nullptr) {
+            return false;
+        }
+        if (gate != nullptr) {
+            ggml_cuda_cutlass_weight gate_weight;
+            if (gate->type != src0->type || !ggml_are_same_shape(gate, src0) ||
+                !ggml_are_same_stride(gate, src0) ||
+                !ggml_cuda_cutlass_weight_from_tensor(gate, gate_weight) || gate_weight.scales_linear == nullptr ||
+                gate_weight.type != src0_weight.type || gate_weight.k != src0_weight.k) {
+                return false;
+            }
+        }
     }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -2050,8 +2079,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static bool ggml_cuda_repacked_mmvq_supported(
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
-        src0->ne[0] > INT_MAX || src0->ne[1] > INT_MAX || src1->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+    if (!ggml_cuda_cutlass_weight_supported(src0) || src1 == nullptr || dst == nullptr ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src0->ne[0] <= 0 || src0->ne[0] > INT_MAX || src0->ne[1] <= 0 || src0->ne[1] > INT_MAX ||
+        src1->ne[0] != src0->ne[0] || src1->ne[1] <= 0 || src1->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[0] != src0->ne[1] || dst->ne[1] != src1->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }
 
@@ -3835,7 +3870,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, gate_n->src[0], glu)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3928,7 +3963,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, gate_n->src[0], glu)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3990,7 +4025,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, gate_n->src[0], glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4029,7 +4064,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, gate->src[0], glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -5107,9 +5142,14 @@ static bool ggml_cuda_repacked_buffer_enabled(int device) {
 
 static bool ggml_backend_cuda_repacked_supports_op(
         ggml_backend_cuda_device_context * dev_ctx, const ggml_tensor * op) {
-    return ggml_cuda_repacked_buffer_enabled(dev_ctx->device) &&
-        op->op == GGML_OP_MUL_MAT &&
-        ggml_cuda_cutlass_mul_mat_supported(op->src[0], op->src[1], op);
+    if (!ggml_cuda_repacked_buffer_enabled(dev_ctx->device) || op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+    return ggml_cuda_cutlass_mul_mat_supported(op->src[0], op->src[1], op) ||
+        (ggml_cuda_repacked_mmvq_supported(op->src[0], op->src[1], op) &&
+         ggml_cuda_should_use_mmvq(op->src[0]->type, cc, op->src[1]->ne[1]));
 }
 
 // TODO: move these functions here

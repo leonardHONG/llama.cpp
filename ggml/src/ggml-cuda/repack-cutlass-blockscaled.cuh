@@ -16,23 +16,25 @@ static __host__ __device__ __forceinline__ int64_t ggml_cuda_cutlass_blockscaled
 }
 
 struct ggml_cuda_cutlass_weight {
-    const char *    values       = nullptr;
-    const uint8_t * scales       = nullptr;
-    int64_t         k            = 0;
-    int             scale_stride = 0;
-    ggml_type       type         = GGML_TYPE_COUNT;
+    const char *    values        = nullptr;
+    const uint8_t * scales        = nullptr;
+    const uint8_t * scales_linear = nullptr;
+    int64_t         k             = 0;
+    ggml_type       type          = GGML_TYPE_COUNT;
 };
 
 struct ggml_cuda_cutlass_weight_layout {
     size_t size_values;
     size_t offset_scales;
     size_t size_scales;
+    size_t offset_scales_linear;
+    size_t size_scales_linear;
     size_t size_allocation;
 
     int k_padded;
     int rows_padded;
+    int scale_blocks;
     int scale_blocks_padded;
-    int scale_stride;
     int k_blocks;
     int rows;
 };
